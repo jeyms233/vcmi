@@ -250,9 +250,9 @@ int getDwellingArmyCost(const CGObjectInstance * target)
 	return cost;
 }
 
-static uint64_t evaluateArtifactArmyValue(const CArtifactInstance * art)
+static uint64_t evaluateArtifactArmyValue(const CArtifact * art)
 {
-	if(art->artType->getId() == ArtifactID::SPELL_SCROLL)
+	if(art->getId() == ArtifactID::SPELL_SCROLL)
 		return 1500;
 
 	auto statsValue =
@@ -267,7 +267,7 @@ static uint64_t evaluateArtifactArmyValue(const CArtifactInstance * art)
 
 	auto classValue = 0;
 
-	switch(art->artType->aClass)
+	switch(art->aClass)
 	{
 	case CArtifact::EartClass::ART_MINOR:
 		classValue = 1000;
@@ -315,7 +315,7 @@ uint64_t RewardEvaluator::getArmyReward(
 	case Obj::WARRIORS_TOMB:
 		return 1000;
 	case Obj::ARTIFACT:
-		return evaluateArtifactArmyValue(dynamic_cast<const CGArtifact *>(target)->storedArtifact);
+		return evaluateArtifactArmyValue(dynamic_cast<const CGArtifact *>(target)->storedArtifact->artType);
 	case Obj::DRAGON_UTOPIA:
 		return 10000;
 	case Obj::HERO:
@@ -328,8 +328,47 @@ uint64_t RewardEvaluator::getArmyReward(
 	case Obj::MAGIC_SPRING:
 		return getManaRecoveryArmyReward(hero);
 	default:
-		return 0;
+		break;
 	}
+
+	auto rewardable = dynamic_cast<const Rewardable::Interface *>(target);
+
+	if(rewardable)
+	{
+		auto totalValue = 0;
+
+		for(auto & info : rewardable->configuration.info)
+		{
+			auto rewardValue = 0;
+
+			if(info.limiter.heroAllowed(hero))
+			{
+				if(!info.reward.artifacts.empty())
+				{
+					for(auto artID : info.reward.artifacts)
+					{
+						const CArtifact * art = dynamic_cast<const CArtifact *>(VLC->artifacts()->getById(artID));
+
+						rewardValue += evaluateArtifactArmyValue(art);
+					}
+				}
+
+				if(!info.reward.creatures.empty())
+				{
+					for(auto stackInfo : info.reward.creatures)
+					{
+						rewardValue += stackInfo.getType()->getAIValue() * stackInfo.getCount();
+					}
+				}
+
+				totalValue += rewardValue > 0 ? rewardValue / (info.reward.artifacts.size() + info.reward.creatures.size()) : 0;
+			}
+		}
+
+		return totalValue;
+	}
+
+	return 0;
 }
 
 uint64_t RewardEvaluator::getArmyGrowth(
@@ -473,7 +512,24 @@ uint64_t RewardEvaluator::getManaRecoveryArmyReward(const CGHeroInstance * hero)
 	return ai->heroManager->getMagicStrength(hero) * 10000 * (1.0f - std::sqrt(static_cast<float>(hero->mana) / hero->manaLimit()));
 }
 
-float RewardEvaluator::getStrategicalValue(const CGObjectInstance * target) const
+float RewardEvaluator::getResourceRequirementStrength(const TResources & res) const
+{
+	float sum = 0.0f;
+
+	for(TResources::nziterator it(res); it.valid(); it++)
+	{
+		//Evaluate resources used for construction. Gold is evaluated separately.
+		if(it->resType != EGameResID::GOLD)
+		{
+			sum += 0.1f * it->resVal * getResourceRequirementStrength(it->resType)
+				+ 0.05f * it->resVal * getTotalResourceRequirementStrength(it->resType);
+		}
+	}
+
+	return sum;
+}
+
+float RewardEvaluator::getStrategicalValue(const CGObjectInstance * target, const CGHeroInstance * hero) const
 {
 	if(!target)
 		return 0;
@@ -491,24 +547,17 @@ float RewardEvaluator::getStrategicalValue(const CGObjectInstance * target) cons
 	case Obj::RESOURCE:
 	{
 		auto resource = dynamic_cast<const CGResource *>(target);
-		return resource->resourceID() == EGameResID::GOLD
-			? 0
-			: 0.2f * getTotalResourceRequirementStrength(resource->resourceID()) + 0.4f * getResourceRequirementStrength(resource->resourceID());
+		TResources res;
+		res[resource->resourceID()] = resource->amount;
+		
+		return getResourceRequirementStrength(res);
 	}
 
 	case Obj::CREATURE_BANK:
 	{
 		auto resourceReward = getCreatureBankResources(target, nullptr);
-		float sum = 0.0f;
-		for (TResources::nziterator it (resourceReward); it.valid(); it++)
-		{
-			//Evaluate resources used for construction. Gold is evaluated separately.
-			if (it->resType != EGameResID::GOLD)
-			{
-				sum += 0.1f * it->resVal * getResourceRequirementStrength(it->resType);
-			}
-		}
-		return sum;
+		
+		return getResourceRequirementStrength(resourceReward);
 	}
 
 	case Obj::TOWN:
@@ -547,8 +596,29 @@ float RewardEvaluator::getStrategicalValue(const CGObjectInstance * target) cons
 		return 0.6f;
 
 	default:
-		return 0;
+		break;
 	}
+
+	auto rewardable = dynamic_cast<const Rewardable::Interface *>(target);
+
+	if(rewardable)
+	{
+		auto resourceReward = 0.0f;
+
+		for(auto & info : rewardable->configuration.info)
+		{
+			if(hero && !info.limiter.heroAllowed(hero))
+			{
+				continue;
+			}
+			
+			resourceReward += getResourceRequirementStrength(info.reward.resources);
+		}
+
+		return resourceReward;
+	}
+
+	return 0;
 }
 
 float RewardEvaluator::evaluateWitchHutSkillScore(const CGObjectInstance * hut, const CGHeroInstance * hero, HeroRole role) const
@@ -611,9 +681,49 @@ float RewardEvaluator::getSkillReward(const CGObjectInstance * target, const CGH
 		return ai->cb->getPlayerRelations(target->tempOwner, ai->playerID) == PlayerRelations::ENEMIES
 			? enemyHeroEliminationSkillRewardRatio * dynamic_cast<const CGHeroInstance *>(target)->level
 			: 0;
+
 	default:
-		return 0;
+		break;
 	}
+
+	auto rewardable = dynamic_cast<const Rewardable::Interface *>(target);
+
+	if(rewardable)
+	{
+		auto totalValue = 0.0f;
+
+		for(auto & info : rewardable->configuration.info)
+		{
+			auto rewardValue = 0.0f;
+
+			if(info.limiter.heroAllowed(hero))
+			{
+				if(!info.reward.spells.empty())
+				{
+					for(auto spellID : info.reward.spells)
+					{
+						const spells::Spell * spell = VLC->spells()->getById(spellID);
+							
+						rewardValue += spell->getLevel() / 4.0f;
+					}
+
+					totalValue += rewardValue / info.reward.spells.size();
+				}
+
+				if(!info.reward.primary.empty())
+				{
+					for(auto value : info.reward.primary)
+					{
+						totalValue += value;
+					}
+				}
+			}
+		}
+
+		return totalValue;
+	}
+
+	return 0;
 }
 
 const HitMapInfo & RewardEvaluator::getEnemyHeroDanger(const int3 & tile, uint8_t turn) const
@@ -697,8 +807,27 @@ int32_t RewardEvaluator::getGoldReward(const CGObjectInstance * target, const CG
 			? heroEliminationBonus + enemyArmyEliminationGoldRewardRatio * getArmyCost(dynamic_cast<const CGHeroInstance *>(target))
 			: 0;
 	default:
-		return 0;
+		break;
 	}
+
+	auto rewardable = dynamic_cast<const Rewardable::Interface *>(target);
+
+	if(rewardable)
+	{
+		auto goldReward = 0;
+
+		for(auto & info : rewardable->configuration.info)
+		{
+			if(info.limiter.heroAllowed(hero))
+			{
+				goldReward += getResourcesGoldReward(info.reward.resources);
+			}
+		}
+
+		return goldReward;
+	}
+
+	return 0;
 }
 
 class HeroExchangeEvaluator : public IEvaluationContextBuilder
